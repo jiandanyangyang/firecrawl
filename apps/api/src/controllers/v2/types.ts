@@ -527,9 +527,9 @@ const pdfParserWithOptions = z
 /**
  * Raster image OCR (PNG, JPEG, JPEG 2000, TIFF, GIF, BMP). Like `pdf` it is
  * part of the default list, so a request that says nothing about parsers OCRs
- * image URLs (behind the imageOcr team flag while it rolls out); an explicit
- * list that omits it (`["pdf"]`, `[]`) opts out and keeps the historical
- * unsupported-file rejection. The object form carries no options yet; it
+ * image URLs (where the deployment has image OCR on, see
+ * lib/image-ocr-gate.ts); an explicit list that omits it (`["pdf"]`, `[]`)
+ * opts out and keeps the historical unsupported-file rejection. The object form carries no options yet; it
  * exists so options can be added later without a breaking change.
  */
 const imageParserWithOptions = z.strictObject({
@@ -813,6 +813,7 @@ const baseScrapeOptions = z.strictObject({
   minAge: z.int().gte(0).optional(),
   storeInCache: z.boolean().prefault(true),
   lockdown: z.boolean().prefault(false),
+  safeMode: z.boolean().optional(),
   redactPII: redactPIISchema,
   // Enterprise: per-request field-level override of the org's threat
   // protection policy. Gated on the team flag + org config (checkPermissions).
@@ -899,10 +900,7 @@ const extractTransformImpl = <T extends ScrapeOptionsBase | undefined>(
   }
 
   if (obj.lockdown && obj.maxAge === undefined) {
-    // 2 years in ms. Number.MAX_SAFE_INTEGER lands ~285,000 years which
-    // overflows Postgres TIMESTAMP arithmetic in the index lookup and silently
-    // returns no rows. 2 years covers any practical cache retention window.
-    result = { ...result, maxAge: 2 * 365 * 24 * 60 * 60 * 1000 };
+    result = { ...result, maxAge: LOCKDOWN_DEFAULT_MAX_AGE_MS };
   }
 
   return result as T extends undefined ? undefined : T;
@@ -1116,6 +1114,7 @@ const scrapeRequestSchemaBase = baseScrapeOptions.extend({
   origin: z.string().optional().prefault("api"),
   integration: integrationSchema.optional().transform(val => val || null),
   zeroDataRetention: z.boolean().optional(),
+  domainTools: z.boolean().optional(),
   __agentInterop: z
     .object({
       auth: z.string(),
@@ -1538,7 +1537,9 @@ export type ScrapeResponse =
   | {
       success: true;
       warning?: string;
-      data: Document;
+      data: Document & {
+        tools?: import("../../services/alexandria/contracts").DiscoveredTool[];
+      };
       scrape_id?: string;
     };
 
@@ -1887,10 +1888,29 @@ type Account = {
   remainingCredits: number;
 };
 
+export const LOCKDOWN_DEFAULT_MAX_AGE_MS = 2 * 365 * 24 * 60 * 60 * 1000;
+
 export type TeamFlags = {
+  exchangeRetrieve?: boolean;
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
   threatProtection?: "disabled" | "allowed" | "forced";
+  safeMode?: boolean;
+  safeModeConfig?: {
+    allowBypassSafeMode?: boolean;
+    lockdown?: boolean;
+    domainControls?: boolean;
+    enforceRobots?: boolean;
+    disableStealthProxy?: boolean;
+    disableAuthentication?: boolean;
+    disableSiteHandling?: boolean;
+    exposeWebdriver?: boolean;
+    useHeadlessUserAgent?: boolean;
+    disablePlatformSelection?: boolean;
+    disableCountrySelection?: boolean;
+    disableAutomaticReferrer?: boolean;
+    allowlist?: string[];
+  };
   siemLogging?: boolean;
   unblockedDomains?: string[];
   forceZDR?: boolean;
@@ -1912,6 +1932,9 @@ export type TeamFlags = {
   menuBeta?: boolean;
   enrichBeta?: boolean;
   professionalProfileCompanyDataBeta?: boolean;
+  // The org's DPA (or partner amendment) restricts how its data may be
+  // handled. Informational only: the API does not change behavior on it.
+  dpaRestricted?: boolean;
   organizationDataSourceAccess?: Record<
     string,
     {
@@ -2323,13 +2346,16 @@ export const searchRequestSchema = z
     sources: z
       .union([
         // Array of strings (simple format)
-        z.array(z.enum(["web", "images", "news"])),
+        z.array(z.enum(["web", "images", "news", "alexandria"])),
         // Array of objects (advanced format)
         z.array(
           z.union([
             webSearchSourceOptions,
             imagesSearchSourceOptions,
             newsSearchSourceOptions,
+            z.strictObject({
+              type: z.literal("alexandria"),
+            }),
           ]),
         ),
       ])
@@ -2367,6 +2393,7 @@ export const searchRequestSchema = z
     // our index. When omitted, the caller integration and rollout cohort decide
     // whether generated highlights are returned or only run in shadow mode.
     highlights: z.boolean().optional(),
+    domainTools: z.boolean().optional(),
     __searchPreviewToken: z.string().optional(),
     threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
