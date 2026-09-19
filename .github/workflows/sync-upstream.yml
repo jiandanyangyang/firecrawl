@@ -27,7 +27,7 @@ jobs:
         run: git remote add upstream https://github.com/firecrawl/firecrawl.git
 
       - name: Fetch upstream
-        run: git fetch upstream --tags --force
+        run: git fetch upstream --tags --force --force
 
       - name: Sync main branch
         run: |
